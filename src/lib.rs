@@ -206,6 +206,9 @@ impl SuperQueue {
                 let subscriber = &subscriber_channels[i];
                 if subscriber.id == actor_id {
                     subscriber_channels.swap_remove(i);
+                    if subscriber_channels.is_empty() {
+                        state.subscriber_channels.remove(&type_id);
+                    }
                     return Ok(());
                 }
             }
