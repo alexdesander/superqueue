@@ -4,15 +4,17 @@ version = "0.1.0"
 edition = "2024"
 authors = ["alexdesander"]
 license = "MIT"
-description = "A tiny, type-routed message bus over crossbeam_channel for fast state and event dispatch, designed primarily for game development."
+description = "A tiny, lock-light, type-routed message bus providing event streams and latest-value topics (snapshots) for fast state and event dispatch."
 readme = "README.md"
 repository = "https://github.com/alexdesander/superqueue"
 documentation = "https://docs.rs/superqueue"
-keywords = ["message-bus", "channel", "actors", "events", "game-dev"]
+keywords = ["message-bus", "pubsub", "events", "actors", "game-dev"]
 categories = ["concurrency", "data-structures", "game-engines"]
 
 [dependencies]
+arc-swap = "1.7"
 crossbeam-channel = "0.5"
+parking_lot = "0.12"
 rand = { version = "0.9", default-features = false, features = ["small_rng", "thread_rng"] }
 rustc-hash = "2.1"
 thiserror = "2.0"

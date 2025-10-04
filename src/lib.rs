@@ -1,95 +1,146 @@
 //! # SuperQueue
 //!
-//! A tiny, lock-light, type-routed message bus built on
-//! [`crossbeam_channel`](https://docs.rs/crossbeam-channel).
+//! A tiny, lock-light, **type-routed message bus**.
 //!
-//! **Primary use-case:** fast and ergonomic state/message dispatch for **game
-//! development** (systems & actors exchanging events without tight coupling).
-//! It also works well for background workers, UI event routing, or modular
-//! plugin systems.
+//! SuperQueue gives you two complementary primitives, both keyed by Rust
+//! `TypeId`:
 //!
-//! **Note:** You have to be careful with deadlocking. Make sure that your
-//! message handlers do not block indefinitely or deadlock with other actors
-//! in case you use the blocking variants.
+//! 1) **Event streams** — classic per-subscriber queues (broadcast or
+//!    single-consumer), optionally bounded for backpressure.
+//! 2) **Latest-value topics** — a single, always-overwritable slot per type
+//!    that every actor can sample independently (one observation per update).
+//!
+//! Primary use cases: fast, ergonomic state/message dispatch for **game
+//! development** (systems & actors exchanging events and sampling shared game
+//! state), background workers, UI event routing, and modular plugin systems.
+//!
+//! **Blocking caution:** The blocking send/receive variants can deadlock if you
+//! create cyclic waits. Prefer non-blocking calls where appropriate.
 //!
 //! ## Highlights
 //!
-//! - **Type-based routing:** subscribers declare the concrete Rust type `T`
-//!   they want. Messages are internally erased (`Arc<dyn Any + Send + Sync>`) and
-//!   downcast on receipt.
-//! - **Broadcast or single-consumer:** send to all subscribers or to exactly one
-//!   subscriber (with non-blocking variants).
-//! - **Backpressure control:** per-subscription bounded or unbounded queues.
-//! - **Simple ownership model:** `SuperQueueActor` unsubscribes itself in `Drop`.
+//! - **Type-based routing:** subscribers declare `T`; messages are erased as
+//!   `Arc<dyn Any + Send + Sync>` and downcast on receipt.
+//! - **Two modes, one API surface:**
+//!   - **Event streams:** broadcast to all, or deliver to exactly one.
+//!   - **Latest-value topics:** publish snapshots; readers see each update at most once.
+//! - **Backpressure control (streams):** per-subscription bounded or unbounded queues.
+//! - **Simple ownership:** `SuperQueueActor` unsubscribes itself in `Drop`.
+//! - **Cheap cloning:** the bus is shared and `Clone`.
 //!
-//! ## Quick start
+//! ## Quick starts
 //!
+//! ### Event stream (broadcast)
 //! ```rust
 //! use superqueue::SuperQueue;
 //!
-//! // Create the bus and two actors
 //! let bus = SuperQueue::new();
-//! let mut receiver = bus.create_actor();
-//! let sender = bus.create_actor();
+//! let mut recv = bus.create_actor();
+//! let send = bus.create_actor();
 //!
-//! // Subscribe the receiver to String messages (unbounded queue)
-//! receiver.subscribe::<String>(None).unwrap();
+//! recv.subscribe::<String>(None).unwrap(); // unbounded queue
+//! send.send("Hello".to_string()).unwrap(); // broadcast (blocking per receiver if full)
 //!
-//! // Send a message
-//! sender.send("Hello, world".to_string()).unwrap();
+//! let msg = recv.read::<String>().unwrap(); // blocking
+//! assert_eq!(&*msg, "Hello");
+//! ```
 //!
-//! // Read it (blocking)
-//! let msg = receiver.read::<String>().unwrap();
-//! assert_eq!(&*msg, "Hello, world");
+//! ### Latest-value topic (snapshot)
+//! ```rust
+//! use superqueue::SuperQueue;
+//!
+//! let bus = SuperQueue::new();
+//! let publisher = bus.create_actor();
+//! let mut reader = bus.create_actor();
+//!
+//! // No subscription needed for latest-value topics.
+//! assert!(reader.read_latest::<u32>().is_none()); // nothing published yet
+//!
+//! publisher.update_latest::<u32>(1);
+//! assert_eq!(*reader.read_latest::<u32>().unwrap(), 1); // sees the new value
+//! assert!(reader.read_latest::<u32>().is_none());       // at most once per update
+//!
+//! publisher.update_latest::<u32>(2);
+//! assert_eq!(*reader.read_latest::<u32>().unwrap(), 2);
+//! ```
+//!
+//! ### Mixing both
+//! ```rust
+//! # use superqueue::SuperQueue;
+//! let bus = SuperQueue::new();
+//! let mut physics = bus.create_actor();
+//! let ai = bus.create_actor();
+//!
+//! // Physics consumes events...
+//! physics.subscribe::<(u32, u32)>(Some(256)).unwrap(); // position updates as events
+//!
+//! // ...and also publishes a latest snapshot AI can poll opportunistically.
+//! ai.update_latest::<f32>(0.016); // delta time in seconds
 //! ```
 //!
 //! ## Concepts
 //!
 //! - A **queue** (`SuperQueue`) is shared and cheap to clone.
-//! - An **actor** (`SuperQueueActor`) represents a participant that can
-//!   subscribe to message **types** and send messages of any type.
-//! - Subscriptions are keyed by `TypeId`. Each subscription creates a private
-//!   channel for that `(TypeId, ActorId)` pair.
+//! - An **actor** (`SuperQueueActor`) can:
+//!   - **Streams:** subscribe to `T` and send/read events of `T`.
+//!   - **Latest:** publish `update_latest<T>(value)` and sample with
+//!     `read_latest<T>() -> Option<Arc<T>>` (no subscription required).
+//! - Stream subscriptions are keyed by `(TypeId, ActorId)` and create a private
+//!   channel. Latest-value topics are keyed only by `TypeId` and hold one slot.
+//!   Each actor keeps its own cursor to know whether it has already observed
+//!   the current latest value of a type.
 //!
-//! ## Choosing a send API
+//! ## Choosing an API
 //!
+//! **Event streams (per-subscriber queues):**
 //! - `send(T)` — **broadcast** to all subscribers of `T`. Blocks per receiver
 //!   if that receiver’s queue is bounded and full.
 //! - `try_send(T)` — broadcast **without blocking**; if *no* receiver had space,
-//!   you get `TrySendError::NoSpaceAvailabe`.
-//! - `send_single(T)` — deliver to **exactly one** subscriber of `T`.
-//!   Prefers a subscriber with available space; otherwise **blocks on a random
-//!   subscriber**.
-//! - `try_send_single(T)` — like `send_single` but **never blocks**; drops the
-//!   message if everyone is full.
+//!   returns `TrySendError::NoSpaceAvailable`.
+//! - `send_single(T)` — deliver to **exactly one** subscriber of `T`. Prefers a
+//!   subscriber with capacity; otherwise **blocks on a random subscriber**.
+//! - `try_send_single(T)` — like `send_single` but **never blocks**; drops if all are full.
 //!
-//! ## Reading
+//! **Latest-value topics (single slot per `T`):**
+//! - `update_latest(T)` — publish/overwrite the current value for type `T`.
+//!   Readers will observe this update once.
+//! - `read_latest::<T>() -> Option<Arc<T>>` — return the newest value **exactly once
+//!   per actor per update**, or `None` if unchanged since the last call.
 //!
-//! - `read<T>()` — blocking receive for type `T`.
-//! - `try_read<T>()` — non-blocking; returns `SuperQueueError::EmptyQueue` if
-//!   nothing is available.
+//! ## Bounded vs unbounded (streams)
 //!
-//! ## Bounded vs unbounded
-//!
-//! - `subscribe::<T>(Some(cap))` makes a bounded channel for this subscriber of
-//!   `T`. Bounded queues provide backpressure.
+//! - `subscribe::<T>(Some(cap))` creates a bounded channel. Bounded queues
+//!   provide backpressure and can cause `send*` to block.
 //! - `subscribe::<T>(None)` creates an unbounded channel.
+//!
+//! **Latest-value topics have no queue and never block.** Updates coalesce
+//! (last-writer-wins); intermediate values may be skipped by readers.
 //!
 //! ## Notes & guarantees
 //!
-//! - All messages are stored as `Arc<T>`; broadcast clones the `Arc` cheaply.
-//! - Unsubscribing and dropping are coordinated so that `send*` does not race
-//!   with receiver removal within a single call.
-//! - This crate uses `std` and `crossbeam_channel`; it is **not** `no_std`.
+//! - All stream messages are stored as `Arc<T>`; broadcast clones the `Arc`.
+//! - Unsubscribe/Drop are coordinated so `send*` does not race with removal
+//!   inside a single call.
+//! - Latest-value topics:
+//!   - There is **one slot per `TypeId`** across the bus (not per actor).
+//!   - `update_latest` overwrites the slot atomically; **no history** is kept.
+//!   - Each actor sees **at most one** value per update; independent cursors.
+//!   - No subscription is needed to publish or read latest values.
+//!   - Non-blocking in both directions; suitable for “state snapshots”
+//!     (e.g., delta-time, world tick, configuration, last camera pose).
+//! - This crate is **not** `no_std`.
 //!
 //! ---
+
+use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use parking_lot::RwLock;
 use rand::Rng;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     any::{Any, TypeId},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -155,9 +206,13 @@ impl SuperQueue {
             subscribers_present: FxHashSet::default(),
             subscriber_channels: FxHashMap::default(),
         };
+        let latest_value_state = LatestValuesState {
+            latest_values: FxHashMap::default(),
+        };
         let inner = SuperQueueInner {
             next_actor_id: AtomicU64::new(0),
-            state: RwLock::new(state),
+            queue_state: RwLock::new(state),
+            latest_value_state: RwLock::new(latest_value_state),
         };
         Self {
             inner: Arc::new(inner),
@@ -180,6 +235,7 @@ impl SuperQueue {
         SuperQueueActor {
             actor_id,
             channels: FxHashMap::default(),
+            latest_value_iterations: FxHashMap::default(),
             queue: self.clone(),
         }
     }
@@ -193,7 +249,8 @@ impl Default for SuperQueue {
 
 struct SuperQueueInner {
     next_actor_id: AtomicU64,
-    state: RwLock<SuperQueueInnerState>,
+    queue_state: RwLock<SuperQueueInnerState>,
+    latest_value_state: RwLock<LatestValuesState>,
 }
 
 struct SuperQueueInnerState {
@@ -206,6 +263,15 @@ struct Subscriber {
     sender: Sender<Msg>,
 }
 
+struct LatestValuesState {
+    latest_values: FxHashMap<TypeId, ArcSwap<LatestValue>>,
+}
+
+struct LatestValue {
+    iteration: u64,
+    value: Msg,
+}
+
 impl SuperQueue {
     /// Broadcast a message to **all** subscribers of this type.
     ///
@@ -214,7 +280,7 @@ impl SuperQueue {
     /// Returns [`SendError::NoSubscribers`] if nobody is subscribed to `type_id`.
     #[inline]
     fn send(&self, type_id: TypeId, data: Msg) -> Result<(), SendError> {
-        let state = self.inner.state.read().unwrap();
+        let state = self.inner.queue_state.read();
         if let Some(subscriber) = state.subscriber_channels.get(&type_id) {
             if subscriber.is_empty() {
                 return Err(SendError::NoSubscribers);
@@ -236,7 +302,7 @@ impl SuperQueue {
     #[inline]
     fn send_single(&self, type_id: TypeId, data: Msg) -> Result<(), SendError> {
         let mut rng = rand::rng();
-        let state = self.inner.state.read().unwrap();
+        let state = self.inner.queue_state.read();
         if let Some(subscribers) = state.subscriber_channels.get(&type_id) {
             if subscribers.is_empty() {
                 return Err(SendError::NoSubscribers);
@@ -262,12 +328,12 @@ impl SuperQueue {
     ///
     /// Attempts to enqueue into every subscriber’s queue without blocking.
     /// If **no** subscriber accepted the message, returns
-    /// [`TrySendError::NoSpaceAvailabe`].
+    /// [`TrySendError::NoSpaceAvailable`].
     ///
     /// Returns [`TrySendError::NoSubscribers`] if nobody is subscribed to `type_id`.
     #[inline]
     fn try_send(&self, type_id: TypeId, data: Msg) -> Result<(), TrySendError> {
-        let state = self.inner.state.read().unwrap();
+        let state = self.inner.queue_state.read();
         if let Some(subscriber) = state.subscriber_channels.get(&type_id) {
             if subscriber.is_empty() {
                 return Err(TrySendError::NoSubscribers);
@@ -291,13 +357,13 @@ impl SuperQueue {
     ///
     /// Picks a randomized starting index and tries each subscriber’s queue
     /// once. If everyone is full, the message is **dropped** and
-    /// [`TrySendError::NoSpaceAvailabe`] is returned.
+    /// [`TrySendError::NoSpaceAvailable`] is returned.
     ///
     /// Returns [`TrySendError::NoSubscribers`] if nobody is subscribed to `type_id`.
     #[inline]
     fn try_send_single(&self, type_id: TypeId, data: Msg) -> Result<(), TrySendError> {
         let mut rng = rand::rng();
-        let state = self.inner.state.read().unwrap();
+        let state = self.inner.queue_state.read();
         if let Some(subscribers) = state.subscriber_channels.get(&type_id) {
             if subscribers.is_empty() {
                 return Err(TrySendError::NoSubscribers);
@@ -329,7 +395,7 @@ impl SuperQueue {
         actor_id: ActorId,
         bounds: Option<usize>,
     ) -> Result<Receiver<Arc<dyn Any + Send + Sync + 'static>>, SuperQueueError> {
-        let mut state = self.inner.state.write().unwrap();
+        let mut state = self.inner.queue_state.write();
         if state.subscribers_present.contains(&(type_id, actor_id)) {
             return Err(SuperQueueError::AlreadySubscribed);
         }
@@ -355,7 +421,7 @@ impl SuperQueue {
     /// Returns [`SuperQueueError::NotSubscribed`] if this actor was not
     /// subscribed to that type.
     fn remove_subscriber(&self, type_id: TypeId, actor_id: ActorId) -> Result<(), SuperQueueError> {
-        let mut state = self.inner.state.write().unwrap();
+        let mut state = self.inner.queue_state.write();
         if state.subscribers_present.contains(&(type_id, actor_id)) {
             state.subscribers_present.remove(&(type_id, actor_id));
             let subscriber_channels = state.subscriber_channels.get_mut(&type_id).unwrap();
@@ -371,6 +437,52 @@ impl SuperQueue {
             }
         }
         Err(SuperQueueError::NotSubscribed)
+    }
+
+    fn update_latest(&self, type_id: TypeId, value: Msg) {
+        // Try to do arc swap if the type is already present in the hashmap
+        {
+            let state = self.inner.latest_value_state.read();
+            if let Some(latest_value) = state.latest_values.get(&type_id) {
+                latest_value.rcu(|p| LatestValue {
+                    value: value.clone(),
+                    iteration: p.iteration + 1,
+                });
+                return;
+            }
+        }
+
+        // If the type is not present, insert a new entry
+        let mut state = self.inner.latest_value_state.write();
+
+        // ---- Try again to do an arc swap, maybe someone else has already created the entry
+        if let Some(latest_value) = state.latest_values.get(&type_id) {
+            latest_value.rcu(|p| LatestValue {
+                value: value.clone(),
+                iteration: p.iteration + 1,
+            });
+            return;
+        }
+
+        let latest_value = ArcSwap::new(Arc::new(LatestValue {
+            value,
+            iteration: 1,
+        }));
+        state.latest_values.insert(type_id, latest_value);
+    }
+
+    fn read_latest(&self, type_id: TypeId, last_read: u64) -> Option<(u64, Msg)> {
+        let state = self.inner.latest_value_state.read();
+        if let Some(entry) = state.latest_values.get(&type_id) {
+            let entry = entry.load();
+            if entry.iteration <= last_read {
+                None
+            } else {
+                Some((entry.iteration, entry.value.clone()))
+            }
+        } else {
+            None
+        }
     }
 }
 
@@ -393,6 +505,7 @@ impl SuperQueue {
 pub struct SuperQueueActor {
     actor_id: ActorId,
     channels: FxHashMap<TypeId, Receiver<Msg>>,
+    latest_value_iterations: FxHashMap<TypeId, u64>,
     queue: SuperQueue,
 }
 
@@ -421,7 +534,7 @@ impl SuperQueueActor {
     /// Non-blocking broadcast of a value of type `T`.
     ///
     /// If **no** receiver could accept it, returns
-    /// [`TrySendError::NoSpaceAvailabe`].
+    /// [`TrySendError::NoSpaceAvailable`].
     pub fn try_send<T>(&self, data: T) -> Result<(), TrySendError>
     where
         T: Any + Send + Sync + 'static,
@@ -518,6 +631,92 @@ impl SuperQueueActor {
         self.queue.remove_subscriber(type_id, self.actor_id)?;
         self.channels.remove(&TypeId::of::<T>());
         Ok(())
+    }
+
+    /// Publish (overwrite) the **latest value** for type `T`.
+    ///
+    /// This updates a single slot shared by all actors for the `TypeId` of `T`.
+    /// Readers use [`read_latest`](Self::read_latest) to observe each update
+    /// **at most once per actor**. Intermediate updates may be skipped if
+    /// multiple `update_latest` calls happen before a reader samples.
+    ///
+    /// Characteristics:
+    /// - **No subscription required.**
+    /// - **Non-blocking.** No backpressure; last-writer-wins.
+    /// - **No history.** Only the newest value is retained.
+    ///
+    /// Typical uses: world/frame state, configuration snapshots, last known
+    /// transform, delta time, “most recent metrics”.
+    ///
+    /// # Examples
+    /// ```
+    /// # use superqueue::SuperQueue;
+    /// let bus = SuperQueue::new();
+    /// let publisher = bus.create_actor();
+    /// let mut reader = bus.create_actor();
+    ///
+    /// publisher.update_latest::<u64>(42);
+    /// assert_eq!(*reader.read_latest::<u64>().unwrap(), 42);
+    /// assert!(reader.read_latest::<u64>().is_none()); // same update seen already
+    /// ```
+    pub fn update_latest<T>(&self, value: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let type_id = TypeId::of::<T>();
+        self.queue.update_latest(type_id, Arc::new(value));
+    }
+
+    /// Read the **latest value** of type `T` **once per update**.
+    ///
+    /// Returns:
+    /// - `Some(Arc<T>)` if a newer value than this actor last observed exists.
+    /// - `None` if no value has ever been published for `T`, or if the actor
+    ///   already consumed the current update.
+    ///
+    /// Characteristics:
+    /// - **Non-blocking.** Never waits.
+    /// - **No subscription required.**
+    /// - **Per-actor cursor.** Each actor observes every update at most once.
+    ///
+    /// # Examples
+    /// ```
+    /// # use superqueue::SuperQueue;
+    /// let bus = SuperQueue::new();
+    /// let producer = bus.create_actor();
+    /// let mut a = bus.create_actor();
+    /// let mut b = bus.create_actor();
+    ///
+    /// assert!(a.read_latest::<i32>().is_none()); // nothing yet
+    ///
+    /// producer.update_latest::<i32>(7);
+    /// assert_eq!(*a.read_latest::<i32>().unwrap(), 7);
+    /// assert!(a.read_latest::<i32>().is_none()); // already seen
+    ///
+    /// // Another actor has an independent cursor and can also see "7" once.
+    /// assert_eq!(*b.read_latest::<i32>().unwrap(), 7);
+    ///
+    /// // Subsequent update:
+    /// producer.update_latest::<i32>(9);
+    /// assert_eq!(*a.read_latest::<i32>().unwrap(), 9);
+    /// assert_eq!(*b.read_latest::<i32>().unwrap(), 9);
+    /// ```
+    pub fn read_latest<T>(&mut self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let type_id = TypeId::of::<T>();
+        if let Some(latest_read) = self.latest_value_iterations.get_mut(&type_id) {
+            let (iteration, msg) = self.queue.read_latest(type_id, *latest_read)?;
+            *latest_read = iteration;
+            let value = msg.downcast::<T>().unwrap();
+            Some(value)
+        } else {
+            let (iteration, msg) = self.queue.read_latest(type_id, 0)?;
+            let value = msg.downcast::<T>().unwrap();
+            self.latest_value_iterations.insert(type_id, iteration);
+            Some(value)
+        }
     }
 }
 
@@ -1077,7 +1276,7 @@ mod tests {
             Err(SuperQueueError::EmptyQueue)
         ));
 
-        // Case B: all subscribers full -> the call is non-blocking and returns NoSpaceAvailabe.
+        // Case B: all subscribers full -> the call is non-blocking and returns NoSpaceAvailable.
         // Refill both to be full again.
         let s_refill = queue.create_actor();
         s_refill.send(10_i32).unwrap(); // fills r1 and r2 (each capacity 1)
@@ -1100,5 +1299,119 @@ mod tests {
             r2.try_read::<i32>(),
             Err(SuperQueueError::EmptyQueue)
         ));
+    }
+
+    #[test]
+    fn latest_value_none_before_any_update() {
+        let queue = SuperQueue::new();
+        let mut r = queue.create_actor();
+
+        // No value published yet => None.
+        assert!(r.read_latest::<i32>().is_none());
+        // Still none on repeated calls.
+        assert!(r.read_latest::<i32>().is_none());
+    }
+
+    #[test]
+    fn latest_value_once_per_update() {
+        let queue = SuperQueue::new();
+        let u = queue.create_actor();
+        let mut r = queue.create_actor();
+
+        u.update_latest::<i32>(1);
+        assert_eq!(*r.read_latest::<i32>().unwrap(), 1);
+        // No new update -> None (requires the <= fix).
+        assert!(r.read_latest::<i32>().is_none());
+
+        u.update_latest::<i32>(2);
+        assert_eq!(*r.read_latest::<i32>().unwrap(), 2);
+        assert!(r.read_latest::<i32>().is_none());
+    }
+
+    #[test]
+    fn latest_value_returns_latest_not_intermediate() {
+        let queue = SuperQueue::new();
+        let u = queue.create_actor();
+        let mut r = queue.create_actor();
+
+        // Several quick updates; reader should only observe the newest one.
+        u.update_latest::<i32>(10);
+        u.update_latest::<i32>(20);
+        u.update_latest::<i32>(30);
+
+        assert_eq!(*r.read_latest::<i32>().unwrap(), 30);
+        assert!(r.read_latest::<i32>().is_none());
+    }
+
+    #[test]
+    fn latest_value_per_actor_cursors_are_independent() {
+        let queue = SuperQueue::new();
+        let u = queue.create_actor();
+        let mut r1 = queue.create_actor();
+        let mut r2 = queue.create_actor();
+
+        u.update_latest::<String>("alpha".to_string());
+
+        // Both actors can observe the same "latest" once.
+        assert_eq!(&*r1.read_latest::<String>().unwrap(), "alpha");
+        assert_eq!(&*r2.read_latest::<String>().unwrap(), "alpha");
+
+        // Neither sees it again until a new update is published.
+        assert!(r1.read_latest::<String>().is_none());
+        assert!(r2.read_latest::<String>().is_none());
+
+        u.update_latest::<String>("beta".to_string());
+        assert_eq!(&*r1.read_latest::<String>().unwrap(), "beta");
+        assert_eq!(&*r2.read_latest::<String>().unwrap(), "beta");
+    }
+
+    #[test]
+    fn latest_value_does_not_require_subscription() {
+        let queue = SuperQueue::new();
+        let updater = queue.create_actor();
+        let mut reader = queue.create_actor();
+
+        // No subscribe() calls at all.
+        updater.update_latest::<u64>(123);
+        assert_eq!(*reader.read_latest::<u64>().unwrap(), 123);
+        assert!(reader.read_latest::<u64>().is_none());
+    }
+
+    #[test]
+    fn latest_value_concurrent_updates_yield_a_single_latest_snapshot() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        let queue = SuperQueue::new();
+        let mut reader = queue.create_actor();
+
+        const THREADS: usize = 16;
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let mut handles = Vec::new();
+
+        for t in 0..THREADS {
+            let q = queue.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                let a = q.create_actor();
+                b.wait();
+                // Each thread publishes a distinct value.
+                a.update_latest::<usize>(1000 + t);
+            }));
+        }
+
+        // Start all updaters near-simultaneously.
+        barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Reader sees exactly one of the published values, then nothing more
+        // until a subsequent update.
+        let v = reader.read_latest::<usize>().unwrap();
+        assert!(*v >= 1000 && *v < 1000 + THREADS);
+        assert!(reader.read_latest::<usize>().is_none());
     }
 }
