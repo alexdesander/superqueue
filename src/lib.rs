@@ -1,3 +1,88 @@
+//! # SuperQueue
+//!
+//! A tiny, lock-light, type-routed message bus built on
+//! [`crossbeam_channel`](https://docs.rs/crossbeam-channel).
+//!
+//! **Primary use-case:** fast and ergonomic state/message dispatch for **game
+//! development** (systems & actors exchanging events without tight coupling).
+//! It also works well for background workers, UI event routing, or modular
+//! plugin systems.
+//!
+//! **Note:** You have to be careful with deadlocking. Make sure that your
+//! message handlers do not block indefinitely or deadlock with other actors
+//! in case you use the blocking variants.
+//!
+//! ## Highlights
+//!
+//! - **Type-based routing:** subscribers declare the concrete Rust type `T`
+//!   they want. Messages are internally erased (`Arc<dyn Any + Send + Sync>`) and
+//!   downcast on receipt.
+//! - **Broadcast or single-consumer:** send to all subscribers or to exactly one
+//!   subscriber (with non-blocking variants).
+//! - **Backpressure control:** per-subscription bounded or unbounded queues.
+//! - **Simple ownership model:** `SuperQueueActor` unsubscribes itself in `Drop`.
+//!
+//! ## Quick start
+//!
+//! ```rust
+//! use superqueue::SuperQueue;
+//!
+//! // Create the bus and two actors
+//! let bus = SuperQueue::new();
+//! let mut receiver = bus.create_actor();
+//! let sender = bus.create_actor();
+//!
+//! // Subscribe the receiver to String messages (unbounded queue)
+//! receiver.subscribe::<String>(None).unwrap();
+//!
+//! // Send a message
+//! sender.send("Hello, world".to_string()).unwrap();
+//!
+//! // Read it (blocking)
+//! let msg = receiver.read::<String>().unwrap();
+//! assert_eq!(&*msg, "Hello, world");
+//! ```
+//!
+//! ## Concepts
+//!
+//! - A **queue** (`SuperQueue`) is shared and cheap to clone.
+//! - An **actor** (`SuperQueueActor`) represents a participant that can
+//!   subscribe to message **types** and send messages of any type.
+//! - Subscriptions are keyed by `TypeId`. Each subscription creates a private
+//!   channel for that `(TypeId, ActorId)` pair.
+//!
+//! ## Choosing a send API
+//!
+//! - `send(T)` — **broadcast** to all subscribers of `T`. Blocks per receiver
+//!   if that receiver’s queue is bounded and full.
+//! - `try_send(T)` — broadcast **without blocking**; if *no* receiver had space,
+//!   you get `TrySendError::NoSpaceAvailabe`.
+//! - `send_single(T)` — deliver to **exactly one** subscriber of `T`.
+//!   Prefers a subscriber with available space; otherwise **blocks on a random
+//!   subscriber**.
+//! - `try_send_single(T)` — like `send_single` but **never blocks**; drops the
+//!   message if everyone is full.
+//!
+//! ## Reading
+//!
+//! - `read<T>()` — blocking receive for type `T`.
+//! - `try_read<T>()` — non-blocking; returns `SuperQueueError::EmptyQueue` if
+//!   nothing is available.
+//!
+//! ## Bounded vs unbounded
+//!
+//! - `subscribe::<T>(Some(cap))` makes a bounded channel for this subscriber of
+//!   `T`. Bounded queues provide backpressure.
+//! - `subscribe::<T>(None)` creates an unbounded channel.
+//!
+//! ## Notes & guarantees
+//!
+//! - All messages are stored as `Arc<T>`; broadcast clones the `Arc` cheaply.
+//! - Unsubscribing and dropping are coordinated so that `send*` does not race
+//!   with receiver removal within a single call.
+//! - This crate uses `std` and `crossbeam_channel`; it is **not** `no_std`.
+//!
+//! ---
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use rand::Rng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -13,36 +98,58 @@ use thiserror::Error;
 type Msg = Arc<dyn Any + Send + Sync + 'static>;
 type ActorId = u64;
 
+/// Common errors for queue usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Error)]
 pub enum SuperQueueError {
+    /// This actor is not subscribed to the requested message type.
     #[error("This SuperQueueActor is not subscribed to read messages of the specified type.")]
     NotSubscribed,
+    /// This actor is already subscribed to the requested message type.
     #[error("This SuperQueueActor is already subscribed to read messages of the specified type.")]
     AlreadySubscribed,
+    /// A non-blocking read found no message in the queue.
     #[error("The queue is empty.")]
     EmptyQueue,
 }
 
+/// Errors returned by blocking/broadcast send operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Error)]
 pub enum SendError {
+    /// No current subscribers exist for the target message type.
     #[error("No subscriber is currently subscribed to read messages of the specified type.")]
     NoSubscribers,
 }
 
+/// Errors returned by non-blocking send operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Error)]
 pub enum TrySendError {
+    /// No current subscribers exist for the target message type.
     #[error("No subscriber is currently subscribed to read messages of the specified type.")]
     NoSubscribers,
+    /// All target subscriber queues were full; the message was not sent.
     #[error("All queues of the subscribers are full. The message has not been sent to anyone.")]
-    NoSpaceAvailabe,
+    NoSpaceAvailable,
 }
 
+/// Shared message bus. Cheap to clone.
+///
+/// Create actors with [`SuperQueue::create_actor`], then subscribe them to types.
+///
+/// ```rust
+/// use superqueue::SuperQueue;
+///
+/// let bus = SuperQueue::new();
+/// let mut a = bus.create_actor();
+/// a.subscribe::<u32>(Some(128)).unwrap(); // bounded per-type queue
+/// ```
 #[derive(Clone)]
 pub struct SuperQueue {
     inner: Arc<SuperQueueInner>,
 }
 
 impl SuperQueue {
+    /// Create a new, empty bus.
+    #[inline]
     pub fn new() -> Self {
         let state = SuperQueueInnerState {
             subscribers_present: FxHashSet::default(),
@@ -57,6 +164,17 @@ impl SuperQueue {
         }
     }
 
+    /// Create a new actor bound to this bus.
+    ///
+    /// The actor initially has **no subscriptions**.
+    ///
+    /// ```rust
+    /// use superqueue::SuperQueue;
+    ///
+    /// let bus = SuperQueue::new();
+    /// let actor = bus.create_actor();
+    /// ```
+    #[inline]
     pub fn create_actor(&self) -> SuperQueueActor {
         let actor_id = self.inner.next_actor_id.fetch_add(1, Ordering::Relaxed);
         SuperQueueActor {
@@ -89,6 +207,12 @@ struct Subscriber {
 }
 
 impl SuperQueue {
+    /// Broadcast a message to **all** subscribers of this type.
+    ///
+    /// Blocks per subscriber if that subscriber’s queue is bounded and full.
+    ///
+    /// Returns [`SendError::NoSubscribers`] if nobody is subscribed to `type_id`.
+    #[inline]
     fn send(&self, type_id: TypeId, data: Msg) -> Result<(), SendError> {
         let state = self.inner.state.read().unwrap();
         if let Some(subscriber) = state.subscriber_channels.get(&type_id) {
@@ -103,6 +227,13 @@ impl SuperQueue {
         Err(SendError::NoSubscribers)
     }
 
+    /// Send to **exactly one** subscriber of this type.
+    ///
+    /// Prefers a subscriber with available space using a randomized starting
+    /// offset. If all are full, **blocks** on a random subscriber.
+    ///
+    /// Returns [`SendError::NoSubscribers`] if nobody is subscribed to `type_id`.
+    #[inline]
     fn send_single(&self, type_id: TypeId, data: Msg) -> Result<(), SendError> {
         let mut rng = rand::rng();
         let state = self.inner.state.read().unwrap();
@@ -127,6 +258,14 @@ impl SuperQueue {
         Err(SendError::NoSubscribers)
     }
 
+    /// Non-blocking broadcast.
+    ///
+    /// Attempts to enqueue into every subscriber’s queue without blocking.
+    /// If **no** subscriber accepted the message, returns
+    /// [`TrySendError::NoSpaceAvailabe`].
+    ///
+    /// Returns [`TrySendError::NoSubscribers`] if nobody is subscribed to `type_id`.
+    #[inline]
     fn try_send(&self, type_id: TypeId, data: Msg) -> Result<(), TrySendError> {
         let state = self.inner.state.read().unwrap();
         if let Some(subscriber) = state.subscriber_channels.get(&type_id) {
@@ -140,7 +279,7 @@ impl SuperQueue {
                 }
             }
             if message_not_sent {
-                return Err(TrySendError::NoSpaceAvailabe);
+                return Err(TrySendError::NoSpaceAvailable);
             } else {
                 return Ok(());
             }
@@ -148,6 +287,14 @@ impl SuperQueue {
         Err(TrySendError::NoSubscribers)
     }
 
+    /// Non-blocking single-consumer send.
+    ///
+    /// Picks a randomized starting index and tries each subscriber’s queue
+    /// once. If everyone is full, the message is **dropped** and
+    /// [`TrySendError::NoSpaceAvailabe`] is returned.
+    ///
+    /// Returns [`TrySendError::NoSubscribers`] if nobody is subscribed to `type_id`.
+    #[inline]
     fn try_send_single(&self, type_id: TypeId, data: Msg) -> Result<(), TrySendError> {
         let mut rng = rand::rng();
         let state = self.inner.state.read().unwrap();
@@ -165,11 +312,17 @@ impl SuperQueue {
             }
             // No subscriber is free to receive the message.
             // Just drop the message.
-            return Err(TrySendError::NoSpaceAvailabe);
+            return Err(TrySendError::NoSpaceAvailable);
         }
         Err(TrySendError::NoSubscribers)
     }
 
+    /// Add a subscriber for a concrete `type_id` with an optional channel bound.
+    ///
+    /// - `bounds = Some(cap)` creates a bounded channel with capacity `cap`.
+    /// - `bounds = None` creates an unbounded channel.
+    ///
+    /// Returns a `Receiver<Msg>` that is owned by the subscribing actor.
     fn add_subscriber(
         &self,
         type_id: TypeId,
@@ -197,6 +350,10 @@ impl SuperQueue {
         Ok(rx)
     }
 
+    /// Remove a subscriber for a concrete `type_id`.
+    ///
+    /// Returns [`SuperQueueError::NotSubscribed`] if this actor was not
+    /// subscribed to that type.
     fn remove_subscriber(&self, type_id: TypeId, actor_id: ActorId) -> Result<(), SuperQueueError> {
         let mut state = self.inner.state.write().unwrap();
         if state.subscribers_present.contains(&(type_id, actor_id)) {
@@ -217,6 +374,22 @@ impl SuperQueue {
     }
 }
 
+/// A participant in the bus. Owns its receiving channels (per message type)
+/// and can send messages of any type.
+///
+/// Dropping an actor automatically unsubscribes all of its subscriptions.
+///
+/// ```rust
+/// use superqueue::SuperQueue;
+///
+/// let bus = SuperQueue::new();
+/// let mut a = bus.create_actor();
+/// let b = bus.create_actor();
+///
+/// a.subscribe::<String>(None).unwrap();
+/// b.send("ping".to_string()).unwrap();
+/// assert_eq!(&*a.read::<String>().unwrap(), "ping");
+/// ```
 pub struct SuperQueueActor {
     actor_id: ActorId,
     channels: FxHashMap<TypeId, Receiver<Msg>>,
@@ -233,6 +406,11 @@ impl Drop for SuperQueueActor {
 }
 
 impl SuperQueueActor {
+    /// Broadcast a value of type `T` to all subscribers of `T`.
+    ///
+    /// Blocks per receiver if their queue is bounded and full.
+    ///
+    /// Returns [`SendError::NoSubscribers`] if nobody is subscribed to `T`.
     pub fn send<T>(&self, data: T) -> Result<(), SendError>
     where
         T: Any + Send + Sync + 'static,
@@ -240,6 +418,10 @@ impl SuperQueueActor {
         self.queue.send(TypeId::of::<T>(), Arc::new(data) as Msg)
     }
 
+    /// Non-blocking broadcast of a value of type `T`.
+    ///
+    /// If **no** receiver could accept it, returns
+    /// [`TrySendError::NoSpaceAvailabe`].
     pub fn try_send<T>(&self, data: T) -> Result<(), TrySendError>
     where
         T: Any + Send + Sync + 'static,
@@ -248,9 +430,10 @@ impl SuperQueueActor {
             .try_send(TypeId::of::<T>(), Arc::new(data) as Msg)
     }
 
-    /// This sends the message to only one random subscriber (if there are any).
-    /// It tries to find a subscriber that has space for the message. If all subscribers
-    /// are full, it picks one and blocks on that subscriber.
+    /// Send to **one** subscriber of `T`.
+    ///
+    /// Tries non-blocking first; if all are full, **blocks** on a random
+    /// subscriber.
     pub fn send_single<T>(&self, data: T) -> Result<(), SendError>
     where
         T: Any + Send + Sync + 'static,
@@ -259,9 +442,9 @@ impl SuperQueueActor {
             .send_single(TypeId::of::<T>(), Arc::new(data) as Msg)
     }
 
-    /// This tries to send the message to only one random subscriber (if there are any).
-    /// It tries to find a subscriber that has space for the message. If all subscribers
-    /// are full, it drops the message.
+    /// Non-blocking single-consumer send for type `T`.
+    ///
+    /// Drops the message if everyone is full.
     pub fn try_send_single<T>(&self, data: T) -> Result<(), TrySendError>
     where
         T: Any + Send + Sync + 'static,
@@ -270,6 +453,10 @@ impl SuperQueueActor {
             .try_send_single(TypeId::of::<T>(), Arc::new(data) as Msg)
     }
 
+    /// Blocking read for messages of type `T`.
+    ///
+    /// Returns [`SuperQueueError::NotSubscribed`] if this actor is not
+    /// subscribed to `T`.
     pub fn read<T>(&self) -> Result<Arc<T>, SuperQueueError>
     where
         T: Any + Send + Sync + 'static,
@@ -283,6 +470,11 @@ impl SuperQueueActor {
         Ok(concrete)
     }
 
+    /// Non-blocking read for messages of type `T`.
+    ///
+    /// Returns:
+    /// - [`SuperQueueError::NotSubscribed`] if not subscribed to `T`.
+    /// - [`SuperQueueError::EmptyQueue`] if the queue currently has no message.
     pub fn try_read<T>(&self) -> Result<Arc<T>, SuperQueueError>
     where
         T: Any + Send + Sync + 'static,
@@ -299,6 +491,12 @@ impl SuperQueueActor {
         Ok(concrete)
     }
 
+    /// Subscribe this actor to messages of type `T`.
+    ///
+    /// - `bounds = Some(cap)` for a bounded queue of capacity `cap`.
+    /// - `bounds = None` for an unbounded queue.
+    ///
+    /// Returns [`SuperQueueError::AlreadySubscribed`] if already subscribed.
     pub fn subscribe<T>(&mut self, bounds: Option<usize>) -> Result<(), SuperQueueError>
     where
         T: Any + Send + Sync + 'static,
@@ -309,6 +507,9 @@ impl SuperQueueActor {
         Ok(())
     }
 
+    /// Unsubscribe this actor from messages of type `T`.
+    ///
+    /// Returns [`SuperQueueError::NotSubscribed`] if not subscribed.
     pub fn unsubscribe<T>(&mut self) -> Result<(), SuperQueueError>
     where
         T: Any + Send + Sync + 'static,
@@ -638,7 +839,7 @@ mod tests {
         s.try_send(1_i32).unwrap(); // fills the single slot
         assert!(matches!(
             s.try_send(2_i32), // dropped (non-blocking)
-            Err(TrySendError::NoSpaceAvailabe)
+            Err(TrySendError::NoSpaceAvailable)
         ));
 
         assert_eq!(*r.read::<i32>().unwrap(), 1);
@@ -659,7 +860,7 @@ mod tests {
         let s = queue.create_actor();
         assert!(matches!(
             s.try_send(123_i32), // must not block
-            Err(TrySendError::NoSpaceAvailabe)
+            Err(TrySendError::NoSpaceAvailable)
         ));
 
         assert!(matches!(
@@ -885,7 +1086,7 @@ mod tests {
         let s_drop = queue.create_actor();
         assert!(matches!(
             s_drop.try_send_single(999_i32),
-            Err(TrySendError::NoSpaceAvailabe)
+            Err(TrySendError::NoSpaceAvailable)
         ));
 
         // Verify neither received the dropped message (they still only have the refill).
