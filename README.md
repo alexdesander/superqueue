@@ -49,7 +49,6 @@ send.send("Hello".to_string())?;           // broadcast (may block if a bounded 
 
 let msg = recv.read::<String>()?;          // blocking read
 assert_eq!(&*msg, "Hello");
-# Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
 ### 2) Latest-value topic (snapshot)
@@ -85,7 +84,6 @@ physics.subscribe::<(u32, u32)>(Some(256))?; // position updates as events
 
 // ...and also samples a latest snapshot AI publishes opportunistically.
 ai.update_latest::<f32>(0.016); // delta time in seconds
-# Ok::<_, Box<dyn std::error::Error>>(())
 ```
 
 ---
